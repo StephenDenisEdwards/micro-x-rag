@@ -32,7 +32,7 @@ ollama pull mistral:7b         # local chat (or any model you prefer)
 pip install -r requirements.txt
 ```
 
-The notebook loads environment variables (including `ANTHROPIC_API_KEY`) from the sibling project `micro-x-agent-loop-python/.env`. Update the path in the notebook's first cell if your layout differs.
+Copy your `.env` file to the project root with at minimum `ANTHROPIC_API_KEY` set. The `.env` file is gitignored.
 
 ## Project Structure
 
