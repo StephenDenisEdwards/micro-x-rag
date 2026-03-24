@@ -12,6 +12,12 @@ venv/
 
 # ChromaDB persistent storage
 chroma_db/
+chroma_db_graph/
+
+# GraphRAG artifacts
+extractions.json
+knowledge_graph.json
+knowledge_graph.html
 
 # Jupyter
 .ipynb_checkpoints/
