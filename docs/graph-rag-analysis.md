@@ -29,7 +29,7 @@ Extracted from 92 chunks (10 pages per PDF, 4 PDFs).
 ### Models
 
 - Extraction: `claude-sonnet-4-20250514` via Anthropic API
-- Community summaries: `mistral:7b` via Ollama (34% CPU / 66% GPU on RTX 3050 Ti, 3.8 GiB VRAM)
+- Community summaries: `claude-sonnet-4-20250514` via Anthropic API (upgraded from `mistral:7b`)
 - Embeddings: `nomic-embed-text` via Ollama
 - Final answers: Claude Sonnet + Ollama
 
