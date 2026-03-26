@@ -543,23 +543,103 @@ Inject product nodes and properties from the engine's catalog data into the grap
 
 #### Recommended approach
 
-**Approach C (graph for discovery, engine for verification)** is the best balance. Pre-compute edges for common scenarios to get the graph connectivity and community benefits, but always verify through the engine before making a compatibility claim to the user. The graph is an index that narrows the search space; the engine is the authority that confirms the answer.
+**Approach C (graph for discovery, engine for verification)** is the best balance. But an important clarification: with this approach, **the constraint engine does not contribute compatibility edges to the graph at build time.** Compatibility is determined live at query time only, when the user's actual requirements are known.
 
-The pre-computed edges should be clearly labelled as scenario-specific:
+Instead, the engine contributes to graph construction in a different way — through its **structured product catalog data.**
+
+#### What the engine contributes at graph build time: product data, not compatibility
+
+The engine's catalog contains rich structured data for 53 hinges and 55 mounting plates — precise specifications, series classifications, mounting methods, brands, and pricing. This data can enrich the knowledge graph without pre-computing any compatibility edges:
+
+**1. Accurate product nodes**
+
+LLM extraction from PDF text produces entities like "Clip Top Blumotion" with approximate specs. The engine's catalog has the exact product with all properties:
 
 ```python
-G.add_edge(hinge, plate,
-    relations={"verified_compatible_with"},
-    scenario="standard_frameless_19mm",
-    brand_locked=True,
-    weight=10,
-    note="Valid for standard frameless cabinet, 19mm door. Verify with constraint engine for other configurations.",
-)
+# From engine catalog — precise, structured
+{
+    "manufacturer_part": "71B3550",
+    "brand": "Blum",
+    "series": "CLIP top BLUMOTION",
+    "application": "full_overlay",
+    "opening_angle_deg": 110,
+    "boring_pattern_mm": 45,
+    "door_thickness_range_mm": [16, 26],
+    "max_door_weight_kg": 7.5,
+    "soft_close": true,
+    "price_usd": 4.85,
+}
 ```
 
-And the prompt should instruct the LLM:
+Injecting these as graph nodes replaces or supplements LLM-extracted entities with verified product data.
 
-> "Compatibility edges in the knowledge graph are pre-computed for common scenarios. For specific customer configurations, always note that compatibility should be verified against exact requirements."
+**2. Structural relationships from catalog data**
+
+The engine's data contains relationships that don't depend on installation context — they're always true:
+
+| Relationship | Example | Source |
+|---|---|---|
+| `manufactured_by` | Blum CLIP top → Blum | `product.brand` |
+| `part_of` (series) | Blum CLIP top BLUMOTION 110° → CLIP top BLUMOTION series | `product.series` |
+| `has_specification` | Blum CLIP top → 110° opening angle | `product.opening_angle_deg` |
+| `has_feature` | Blum CLIP top BLUMOTION → soft-close | `product.soft_close` |
+| `series_compatible_with` | CLIP mounting plate → CLIP top series | `plate.compatible_hinge_series` |
+
+These edges improve graph connectivity and community quality without any contextual ambiguity. A plate that is series-compatible with a hinge series is *always* series-compatible — that doesn't depend on door thickness or cabinet position.
+
+**3. Better entity resolution**
+
+The engine's canonical `manufacturer_part` numbers (e.g., "71B3550") and structured descriptions provide anchor points for merging with LLM-extracted entities. Instead of fuzzy-matching "Clip Top Blumotion" to "CLIP top BLUMOTION 110°", you can match on the manufacturer part number if the extraction prompt is modified to capture product codes.
+
+#### What the engine contributes at query time: live compatibility verification
+
+When a user asks a compatibility question, the engine is called with their actual requirements:
+
+```
+User: "What plates work with the Blum CLIP top for my 19mm corner cabinet?"
+                │
+                ▼
+        ┌───────────────────┐
+        │ Graph Retrieval    │  → finds plates connected to CLIP top
+        └───────┬───────────┘     via series_compatible_with and
+                │                  LLM-extracted relationships
+                ▼
+        ┌───────────────────┐
+        │ Engine Verify      │  → evaluates candidates against actual
+        └───────┬───────────┘     requirements: corner → R013 filters
+                │                  to ≥155° only; 19mm door → R015 checks
+                ▼                  cup depth; etc.
+        ┌───────────────────┐
+        │ LLM Answer         │  → "For your 19mm corner cabinet, 3 plates
+        └───────────────────┘     are compatible. The Blum CLIP cruciform
+                                   0mm is the best match at $1.20/plate.
+                                   Standard 110° hinges were excluded
+                                   because corner cabinets require ≥155°
+                                   opening angle (Rule R013)."
+```
+
+The graph narrows the candidate space using structural relationships (series compatibility, brand, product type). The engine verifies each candidate against the user's exact context. The LLM explains the results using the engine's rule traces.
+
+#### Why this separation works
+
+| Concern | How it's handled |
+|---|---|
+| Graph has no false compatibility claims | No compatibility edges in the graph — only structural relationships |
+| Communities still form meaningfully | Products cluster by series, brand, and features — which is what users browse by |
+| Contextual constraints respected | Engine evaluates with actual door thickness, cabinet position, weight, etc. |
+| Corner cabinet invalidation | Engine catches it live via R013 — graph never claimed compatibility |
+| Soft constraints | Engine returns them in rule traces — LLM can say "compatible but no soft-close" |
+| Brand lock | Engine applies it based on the user's preference at query time |
+
+#### The two contributions, clearly separated
+
+| | Graph Build Time | Query Time |
+|---|---|---|
+| **What** | Product nodes + structural relationships from engine catalog | Live compatibility verification against user requirements |
+| **Source** | Engine's product data (JSON catalogs) | Engine's `solve()` with user's `CustomerRequirements` |
+| **Edge types** | `manufactured_by`, `part_of`, `has_specification`, `has_feature`, `series_compatible_with` | None added to graph — results go directly into the LLM prompt |
+| **Contextual?** | No — these relationships are always true | Yes — evaluated against specific door, cabinet, overlay, etc. |
+| **Risk of being wrong** | None — these are product facts | None — engine is deterministic against known requirements |
 
 ### Data Available Today
 
@@ -576,11 +656,14 @@ The concealed hinge data covers the same Blum and Grass products that are in the
 
 ## Summary
 
-| Aspect | Current (LLM only) | With Compatibility Service |
-|--------|-------------------|---------------------------|
-| Compatibility data source | Inferred from catalog text | Ground truth from service + inferred from text |
-| Graph connectivity | 206 components, fragmented | Significantly fewer components, well-connected |
-| Community clusters | Based on textual co-occurrence | Based on real product systems |
-| Multi-hop queries | Often fail due to missing edges | Reliable traversal through verified edges |
-| Answer confidence | "appears to be compatible" | "verified compatible" |
-| Product coverage | Limited to indexed catalog pages | Extends beyond catalogs |
+| Aspect | Current (LLM only) | With Constraint Engine |
+|--------|-------------------|----------------------|
+| Product data in graph | LLM-extracted (approximate, inconsistent) | Structured catalog data (precise specs, canonical names) + LLM-extracted |
+| Structural relationships | Inferred from text (often missed) | Injected from catalog (series, brand, specs) + inferred from text |
+| Compatibility determination | Inferred from text at build time | Deterministic, evaluated live at query time against actual requirements |
+| Graph connectivity | 206 components, fragmented | Fewer components — structural edges from catalog data bridge islands |
+| Community clusters | Based on textual co-occurrence | Based on product series, brand, and features |
+| Contextual constraints | Not captured | Evaluated by engine: door thickness, cabinet position, weight, overlay |
+| Answer confidence | "appears to be compatible" | "verified compatible for your 19mm frameless cabinet" |
+| Failure explanations | None | Full rule traces: "R013: corner cabinets require ≥155° opening angle" |
+| Product coverage | Limited to indexed catalog pages | Extends beyond catalogs via engine's structured data |
