@@ -30,5 +30,5 @@ knowledge_graph.html
 Thumbs.db
 .DS_Store
 
-# Claude Code
-.claude/
+# Claude Code (settings tracked, but not memory)
+.claude/memory/

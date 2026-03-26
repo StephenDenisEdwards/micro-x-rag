@@ -2,8 +2,8 @@
 
 This document outlines practical improvements to the GraphRAG pipeline, organized by priority. Each item explains what it is, why it matters, what to change, and the expected impact.
 
-For a detailed explanation of how each step in the notebook works, see [graphrag-notebook-guide.md](graphrag-notebook-guide.md).
-For a comparison of GraphRAG vs Standard RAG results, see [graphrag-vs-standard-rag.md](graphrag-vs-standard-rag.md).
+For a detailed explanation of how each step in the notebook works, see [graphrag-notebook-guide.md](../design/graphrag-notebook-guide.md).
+For a comparison of GraphRAG vs Standard RAG results, see [graphrag-vs-standard-rag.md](../design/graphrag-vs-standard-rag.md).
 
 ---
 
