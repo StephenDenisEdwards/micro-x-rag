@@ -426,6 +426,141 @@ The LLM prompt can then distinguish between the two:
 
 This is a significant advantage over both pure LLM extraction (which has no concept of brand lock) and a naive deterministic integration (which would either show all combinations or only same-brand ones, with no way to explain the distinction).
 
+### Contextual Compatibility: The Deeper Problem
+
+Brand lock is the simplest case because it's binary (on or off). But the constraint engine reveals a more fundamental issue: **compatibility between two products is not a property of the products — it's a property of the products in a specific installation context.**
+
+The same hinge + plate pair can be:
+
+| Scenario | Result | Why |
+|----------|--------|-----|
+| 19mm door, standard cabinet | Valid | All rules pass |
+| 16mm door, same cabinet | Invalid | R015: door thickness < cup depth + 2mm |
+| 19mm door, corner cabinet | Invalid | R013: 110° hinge < required 155° for corners |
+| 19mm door, 22mm desired overlay | Invalid | R004: overlay outside plate's achievable range |
+| 19mm door, 12kg door weight, 2 hinges | Invalid | R007: 12kg > 7.5kg × 2 = 15kg capacity |
+| 19mm door, 12kg door weight, 3 hinges | Valid | R007: 12kg ≤ 7.5kg × 3 = 22.5kg capacity |
+
+A graph edge that says `verified_compatible_with` without context is potentially misleading. The user asks "does this hinge work with this plate?" and the graph says yes — but for *their* specific door, it doesn't.
+
+#### The five contextual concerns
+
+**1. Scenario explosion**
+
+The parameter space is continuous: door thickness (16-26mm), door height (determines hinge count), door weight, desired overlay, boring pattern (42/45/48mm), cabinet type (frameless/face frame), cabinet position (standard/corner/blind corner), face frame width... You cannot pre-compute all combinations. Common scenarios cover frequent cases but will miss edge cases.
+
+**2. Derived values change the answer**
+
+R008 derives hinges per door from door height (≤889mm→2, ≤1400mm→3, ≤1800mm→4, >1800mm→5). This feeds into R007 — weight capacity is per-hinge rating × hinge count. A pre-computed edge doesn't capture which height range it was computed for. A pair valid for a 720mm door (2 hinges, 15kg capacity) might be invalid for a 1500mm door if the door is heavy enough.
+
+**3. Corner cabinets silently invalidate standard results**
+
+If you pre-compute for `cabinet_position=STANDARD`, the graph has edges for 110° hinges. A user asking about a corner cabinet gets those edges in retrieval, but R013 requires ≥155°. The graph says compatible, the engine says no. This is the most dangerous failure mode — the answer is confidently wrong.
+
+**4. Soft constraints blur the line**
+
+Soft close is a preference, not a hard constraint. A non-soft-close hinge passes all hard rules. Should the graph show it as `verified_compatible_with`? If yes, the user gets recommendations without the feature they want. If no, you're hiding valid options. The graph's binary edge model doesn't capture "compatible but doesn't meet your preference."
+
+**5. Overlay is scenario-specific**
+
+A plate might achieve 14-20mm overlay for full overlay but only 3-9mm for half overlay. An edge saying "compatible" without specifying the overlay and application context is incomplete.
+
+#### Approaches to handle contextual compatibility
+
+**Approach A: Conditional edges**
+
+Store conditions on each edge:
+
+```python
+G.add_edge(hinge, plate,
+    relations={"verified_compatible_with"},
+    conditions={
+        "door_thickness_range_mm": [16, 26],
+        "cabinet_position": "standard",
+        "application": "full_overlay",
+        "overlay_range_mm": [14, 20],
+    },
+)
+```
+
+At retrieval time, filter edges by the user's context before including them in the prompt. More complex but accurate.
+
+**Pros:** Precise, no false positives.
+**Cons:** Requires knowing the user's context at retrieval time. The graph traversal logic becomes context-aware. Complex to implement.
+
+**Approach B: Scenario-bucketed edges**
+
+Pre-compute for a small set of common scenarios and tag each edge:
+
+```python
+COMMON_SCENARIOS = {
+    "standard_frameless_19mm": {"cabinet_type": "frameless", "door_thickness_mm": 19, "cabinet_position": "standard", ...},
+    "standard_faceframe_19mm": {"cabinet_type": "face_frame", "door_thickness_mm": 19, "cabinet_position": "standard", ...},
+    "corner_frameless_19mm":   {"cabinet_type": "frameless", "door_thickness_mm": 19, "cabinet_position": "corner", ...},
+}
+```
+
+The graph has multiple edges between the same pair, one per scenario. Retrieval selects the scenario that best matches the user's question.
+
+**Pros:** Finite, manageable number of edges. Scenario tag is easy to filter on.
+**Cons:** Doesn't cover uncommon scenarios. Requires mapping user queries to scenario buckets.
+
+**Approach C: Graph for discovery, engine for verification (recommended)**
+
+Use the graph edges — even imprecise ones — to narrow candidates. Then call the engine live with the user's actual requirements to verify.
+
+```
+User: "What plates work with the Blum CLIP top for my 19mm corner cabinet?"
+                │
+                ▼
+        ┌───────────────┐
+        │ Graph Retrieval │  → finds 12 plates connected to Blum CLIP top
+        └───────┬───────┘     via verified_compatible_with edges
+                │
+                ▼
+        ┌───────────────┐
+        │ Engine Verify  │  → evaluates 12 pairs against actual requirements
+        └───────┬───────┘     (corner cabinet → R013 filters to ≥155° only)
+                │
+                ▼
+        ┌───────────────┐
+        │ LLM Answer    │  → "3 plates are compatible with your corner cabinet.
+        └───────────────┘     The other 9 require ≥155° opening angle which
+                              standard hinges don't provide."
+```
+
+The graph gets you from 2,915 combinations to ~20 candidates. The engine confirms which ones actually work for *this* user's context. The LLM explains why some were filtered out using the engine's rule traces.
+
+**Pros:** Graph handles broad/thematic questions. Engine handles precise compatibility. No false positives on compatibility claims. Full rule traces for explanations.
+**Cons:** Requires a live call to the engine at query time. Adds latency (though the engine runs in milliseconds on pre-filtered candidates).
+
+**Approach D: Product nodes only, no compatibility edges**
+
+Inject product nodes and properties from the engine's catalog data into the graph, but don't pre-compute compatibility edges at all. Use the graph for thematic/broad queries ("what product categories exist?", "what brands do you carry?"). Call the engine at runtime for any compatibility question.
+
+**Pros:** Cleanest separation of concerns. No risk of stale or contextually wrong edges. Graph stays simple.
+**Cons:** Loses the graph connectivity benefit for compatibility questions. Communities won't form around product systems.
+
+#### Recommended approach
+
+**Approach C (graph for discovery, engine for verification)** is the best balance. Pre-compute edges for common scenarios to get the graph connectivity and community benefits, but always verify through the engine before making a compatibility claim to the user. The graph is an index that narrows the search space; the engine is the authority that confirms the answer.
+
+The pre-computed edges should be clearly labelled as scenario-specific:
+
+```python
+G.add_edge(hinge, plate,
+    relations={"verified_compatible_with"},
+    scenario="standard_frameless_19mm",
+    brand_locked=True,
+    weight=10,
+    note="Valid for standard frameless cabinet, 19mm door. Verify with constraint engine for other configurations.",
+)
+```
+
+And the prompt should instruct the LLM:
+
+> "Compatibility edges in the knowledge graph are pre-computed for common scenarios. For specific customer configurations, always note that compatibility should be verified against exact requirements."
+
 ### Data Available Today
 
 | Product Family | Products | Status |
