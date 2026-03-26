@@ -373,6 +373,59 @@ With the constraint engine integrated:
 
 - **"Why doesn't this hinge work with this plate?"** — the engine's `RuleResult` traces explain exactly which constraint failed and why. This can be included in the graph context or used in post-generation verification to provide precise failure explanations.
 
+### Brand Lock: Mechanical Compatibility vs Business Rules
+
+The constraint engine's `brand_lock` flag surfaces an important distinction: **"these products can work together"** vs **"these products should be sold together."**
+
+A Blum CLIP top hinge might physically fit a Grass Tiomos mounting plate — the boring pattern matches, the mounting method is compatible, and the overlay range works. But no manufacturer would recommend it, no distributor would sell it as a set, and no warranty would cover it. The constraint engine treats brand lock as a customer preference (`brand_lock: bool = True` on `CustomerRequirements`), not a product property. When enabled, hinge and plate must be the same brand. When disabled, cross-brand combinations are allowed if all other rules pass.
+
+**The problem for GraphRAG:** The user asking "What plates work with this hinge?" could mean either question. If you only pre-compute with brand lock on, you give the safe answer but miss technically valid options. If you only pre-compute with it off, you might suggest combinations that a professional would reject.
+
+**Solution: Pre-compute both and tag the edges.**
+
+Run the engine twice for each scenario — once with `brand_lock=True`, once with `brand_lock=False`:
+
+```python
+for scenario in common_scenarios:
+    # Same-brand combinations (recommended)
+    locked_req = CustomerRequirements(**scenario, brand_lock=True)
+    for config in engine.solve(locked_req):
+        G.add_edge(
+            normalize_name(config.hinge.description),
+            normalize_name(config.plate.description),
+            relations={"verified_compatible_with"},
+            brand_locked=True,
+            weight=10,
+        )
+
+    # Cross-brand combinations (technically valid)
+    unlocked_req = CustomerRequirements(**scenario, brand_lock=False)
+    for config in engine.solve(unlocked_req):
+        if config.hinge.brand != config.plate.brand:
+            G.add_edge(
+                normalize_name(config.hinge.description),
+                normalize_name(config.plate.description),
+                relations={"verified_compatible_with"},
+                brand_locked=False,
+                weight=5,  # Lower weight than same-brand edges
+            )
+```
+
+This gives the graph both types of edges:
+
+```
+Blum CLIP top --[verified_compatible_with, brand_locked=true,  weight=10]--> Blum CLIP cruciform
+Blum CLIP top --[verified_compatible_with, brand_locked=false, weight=5 ]--> Grass Tiomos plate
+```
+
+At retrieval time, same-brand edges are weighted higher and traversed first. But the cross-brand edges exist, so when a user explicitly asks "can I use a Blum hinge with a Grass plate?", the graph has that information.
+
+The LLM prompt can then distinguish between the two:
+
+> "The **Blum CLIP cruciform plate** is the recommended match (same brand, full warranty coverage, manufacturer-tested combination). The **Grass Tiomos plate** is technically compatible based on mechanical specifications, but this is a cross-brand pairing — check with your distributor regarding warranty and support."
+
+This is a significant advantage over both pure LLM extraction (which has no concept of brand lock) and a naive deterministic integration (which would either show all combinations or only same-brand ones, with no way to explain the distinction).
+
 ### Data Available Today
 
 | Product Family | Products | Status |
