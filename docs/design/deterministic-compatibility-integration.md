@@ -223,6 +223,169 @@ For maximum reliability, use both. For minimal cost, start with graph enrichment
 
 ---
 
+## Concrete Integration: window-project Constraint Engine
+
+The [window-project](../../) repository (`C:\Users\steph\source\repos\window-project`) contains a production constraint engine that is a direct implementation of the deterministic compatibility service described above. This section maps the abstract design to the concrete system.
+
+### What the Constraint Engine Does
+
+Given customer requirements (cabinet type, door dimensions, overlay, brand preference), the engine deterministically evaluates **all valid product combinations** and returns ranked configurations with full explainability traces. Every recommendation is provably correct — no recommendation reaches the user without passing all constraint rules, and every recommendation includes the full rule trace showing *why* it's valid.
+
+There are two engine versions:
+- **V1** (`engine_v1/`): Production hinge engine — specialised for concealed hinge + mounting plate pairs (N=2). 53 hinges × 55 plates = 2,915 combinations, 14 constraint rules, 70+ tests.
+- **V2** (`engine_v2/`): Generic N-candidate solver — handles any product family shape (N=1, N=2, N=3+). Three families prototyped: concealed hinges, drawer slides, LED lighting.
+
+### How the Engine Maps to GraphRAG Integration
+
+| Abstract Concept (this doc) | Concrete Implementation (window-project) |
+|---|---|
+| Compatibility service | `HingeConstraintEngine.solve()` or `NCandidateSolver.solve()` |
+| Structured compatibility pairs | `Configuration` objects — each contains hinge, plate, rule results |
+| `source` / `target` fields | `Configuration.hinge` and `Configuration.plate` |
+| `relationship: compatible_with` | `Configuration.valid == True` (all rules passed) |
+| `conditions` | `RuleResult.values_compared` — door thickness, overlay, boring pattern, etc. |
+| `confidence: 1.0` | Always 1.0 — these are deterministic evaluations, not inferences |
+| Entity name mapping | `ManufacturerProduct.manufacturer_part` (canonical ID) maps to graph entity names |
+
+### What the Engine Provides That LLM Extraction Cannot
+
+**14 constraint rules evaluated per combination:**
+
+| Rule | What It Checks | Why LLM Extraction Misses It |
+|------|---------------|------------------------------|
+| R001 Brand Lock | Hinge and plate must be same brand | LLM may pair cross-brand products |
+| R002 Series Compatibility | Hinge series must be in plate's compatible list | Buried in spec tables across pages |
+| R003 Cabinet Type Match | Hinge, plate, and requirements must agree | Often implicit in catalog context |
+| R004 Overlay in Range | Desired overlay within plate's achievable range | Requires overlay lookup table computation |
+| R005 Inset Support | Plate must support inset application | Small footnote in catalog |
+| R006 Door Thickness | Door thickness within hinge's rated range | LLM may extract range incorrectly |
+| R007 Door Weight | Door weight ≤ capacity × number of hinges | Requires derived hinge count |
+| R008 Hinges Per Door | Height-based formula (≤889mm→2, ≤1400mm→3, etc.) | Not in any single chunk |
+| R009 Boring Pattern | Cabinet boring must match hinge boring | Simple but often missed |
+| R011 Face Frame Overlay | Overlay ≤ frame width - 3mm | Conditional rule, rarely stated |
+| R012 Adjacent Door Clearance | Combined overlay ≤ partition thickness | Multi-door spatial constraint |
+| R013 Corner Cabinet Angle | Opening angle ≥ 155° for corners | Context-dependent |
+| R014 Mounting Method | Hinge mounting compatible with plate mounting | Compatibility matrix lookup |
+| R015 Cup Depth | Door thickness ≥ cup depth + 2mm | Derived from two different specs |
+
+The LLM might extract that "Tiomos is a hinge" and "Tiomos has soft-close" — but it cannot compute that a specific Tiomos model paired with a specific mounting plate achieves exactly 16mm overlay on a 3/4" frameless cabinet door with 45mm boring at a combined price of $12.50 per door. The constraint engine can.
+
+### Integration Architecture
+
+```
+┌─────────────────────────────────┐
+│  window-project                 │
+│  Constraint Engine              │
+│                                 │
+│  solve(requirements)            │
+│    → list[Configuration]        │
+│      ├─ hinge (product details) │
+│      ├─ plate (product details) │
+│      ├─ valid (bool)            │
+│      └─ rule_results (traces)   │
+└───────────────┬─────────────────┘
+                │
+                ▼
+┌─────────────────────────────────┐
+│  micro-x-rag                    │
+│  Knowledge Graph                │
+│                                 │
+│  For each valid Configuration:  │
+│    add_edge(                    │
+│      hinge → verified_          │
+│      compatible_with → plate,   │
+│      conditions={overlay,       │
+│        cabinet_type, ...},      │
+│      source="constraint_engine" │
+│    )                            │
+└─────────────────────────────────┘
+```
+
+### Practical Integration Steps
+
+**Step 1: Import the engine**
+
+The constraint engine is a pure Python package with no database dependencies (JSON-based). It can be imported directly:
+
+```python
+from engine_v1.solver import HingeConstraintEngine
+from engine_v1.loader import load_hinges, load_plates
+```
+
+Or via the V2 generic solver:
+
+```python
+from engine_v2.core.solver_n import NCandidateSolver
+from engine_v2.core.registry import FamilyRegistry
+```
+
+**Step 2: Generate all valid combinations for common scenarios**
+
+Rather than querying per-user-request, pre-compute valid combinations for common cabinet configurations and inject them into the graph at build time:
+
+```python
+common_scenarios = [
+    {"cabinet_type": "frameless", "door_thickness_mm": 19, "boring_pattern_mm": 45, ...},
+    {"cabinet_type": "face_frame", "door_thickness_mm": 19, "boring_pattern_mm": 45, ...},
+    # etc.
+]
+
+engine = HingeConstraintEngine(hinges, plates)
+for scenario in common_scenarios:
+    configs = engine.solve(CustomerRequirements(**scenario))
+    for config in configs:
+        # Add verified edge to the knowledge graph
+        G.add_edge(
+            normalize_name(config.hinge.description),
+            normalize_name(config.plate.description),
+            relations={"verified_compatible_with"},
+            source="constraint_engine",
+            weight=10,  # Higher weight than LLM-extracted edges
+            conditions=scenario,
+        )
+```
+
+**Step 3: Entity name mapping**
+
+The engine uses `manufacturer_part` as canonical identity (e.g., "71B3550") and `description` for display names (e.g., "Blum CLIP top BLUMOTION 110° full_overlay"). The graph has LLM-extracted names like "Clip Top Blumotion". Mapping options:
+
+1. **Include manufacturer part numbers in the extraction prompt** — modify the GraphRAG extraction to capture product codes, then match on codes
+2. **Fuzzy match on descriptions** — use the existing `SequenceMatcher` or embedding similarity to match engine descriptions to graph entity names
+3. **Add engine products as graph nodes directly** — create nodes from engine product data with both the canonical name and manufacturer part, then merge with existing graph nodes
+
+**Step 4: Post-generation verification via the API**
+
+The window-project includes a FastAPI demo at `demo/app.py`:
+
+```
+POST /api/solve/concealed_hinge
+```
+
+For post-generation verification, extract compatibility claims from the LLM answer, construct `CustomerRequirements` from the claim context, and call `solve()`. If the claimed combination appears in the results, it's verified. If not, it's contradicted.
+
+### What This Unlocks for GraphRAG
+
+With the constraint engine integrated:
+
+- **"What mounting plates work with soft-close hinges for a 3/4" frameless door?"** — the engine has pre-computed every valid hinge+plate pair for this scenario. The graph traversal follows `verified_compatible_with` edges to return exact products with prices.
+
+- **"Compare Blum vs Grass options for my cabinet"** — the engine evaluates both brands against the same requirements. The graph contains verified configurations from each, and the LLM can compare them with confidence.
+
+- **"Why doesn't this hinge work with this plate?"** — the engine's `RuleResult` traces explain exactly which constraint failed and why. This can be included in the graph context or used in post-generation verification to provide precise failure explanations.
+
+### Data Available Today
+
+| Product Family | Products | Status |
+|---|---|---|
+| Concealed hinges | 53 hinges + 55 mounting plates | Real catalog data, production rules |
+| Drawer slides | 4 slides | Synthetic prototype |
+| LED lighting | 5 bars + 4 drivers + 4 dimmers | Synthetic prototype |
+| 10 more families | Not yet modelled | Planned in production roadmap |
+
+The concealed hinge data covers the same Blum and Grass products that are in the micro-x-rag PDF catalogs, making it immediately usable for integration.
+
+---
+
 ## Summary
 
 | Aspect | Current (LLM only) | With Compatibility Service |
