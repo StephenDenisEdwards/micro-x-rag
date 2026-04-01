@@ -13,11 +13,15 @@ venv/
 # ChromaDB persistent storage
 chroma_db/
 chroma_db_graph/
+chroma_db_graph_test/
+chroma_db_graph_test2/
+chroma_db_verify/
 
 # GraphRAG artifacts
 extractions.json
 knowledge_graph.json
 knowledge_graph.html
+test_graph.html
 
 # Jupyter
 .ipynb_checkpoints/
@@ -30,5 +34,5 @@ knowledge_graph.html
 Thumbs.db
 .DS_Store
 
-# Claude Code (settings tracked, but not memory)
-.claude/memory/
+# Claude Code
+.claude/
